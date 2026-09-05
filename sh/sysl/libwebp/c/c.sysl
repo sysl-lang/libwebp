@@ -1,0 +1,149 @@
+// libwebp as C declares it: the one-shot decoders, the one-shot encoders, the header-features
+// struct the decoder fills in, and the status enumeration everything reports through.
+//
+// **Nothing is vendored.** libwebp is a system library — one package on macOS, Debian and Arch
+// alike — and `package.hocon` asks `pkg-config` where it is. So there is no `defines` block and no
+// build option to get wrong: the objects are the platform's, SIMD kernels included.
+//
+// Nothing here is meant to be called by a program. A decoder answers a pointer the library
+// allocated or null and says nothing about which of half a dozen things went wrong; an encoder
+// answers a length of zero and says even less. The module above turns those into `Image`,
+// `Encoded` and an `Error` with sentences.
+//
+// **Only the one-shot surface is declared.** The incremental decoder (`WebPIDecoder`), the
+// configured paths (`WebPDecode`, `WebPEncode` and their `WebPDecoderConfig`/`WebPConfig`), and the
+// `WebPPicture` machinery are all deliberately absent — see the module above for why, and what it
+// would take to add them.
+
+module sh.sysl.libwebp.c
+
+@include("webp/decode.h")
+@include("webp/encode.h")
+
+// ## What the bitstream says about itself
+//
+// `WebPBitstreamFeatures` is the one struct in this package that libwebp writes into storage this
+// package placed, so every field's `offsetof` is asserted against the header in `c/tests.sysl` —
+// an upstream that reorders one then fails a test rather than reading the wrong four bytes for
+// ever.
+//
+// `pad` is upstream's own reservation and is never read. It is declared because the struct's *size*
+// is part of the contract: `get_features_internal` writes forty bytes whatever this package thinks
+// the interesting ones are.
+struct BitstreamFeatures
+    width: int
+    height: int
+    has_alpha: int
+    has_animation: int
+
+    // 0 where the file mixes both or does not say, 1 lossy (VP8), 2 lossless (VP8L). **An animation
+    // answers 0**, because its frames need not agree.
+    format: int
+
+    pad: [5]u32
+
+// ## What the library is
+extern "WebPGetDecoderVersion" get_decoder_version() -> int
+
+extern "WebPGetEncoderVersion" get_encoder_version() -> int
+
+// ## Reading a header
+//
+// Width and height, and a validation of the header, from the first few bytes. `width` and `height`
+// may be null where only the validation is wanted.
+extern "WebPGetInfo" get_info(data: *u8, data_size: usize, width: *int, height: *int) -> int
+
+// **`WebPGetFeatures` itself is `static WEBP_INLINE` and has no symbol**, so it cannot be an
+// `extern`. What it does is call this with the ABI version the header was compiled against, which a
+// `c const` block below reads — so there is no shim here, only the version travelling the way
+// upstream intends it to.
+extern "WebPGetFeaturesInternal" get_features_internal(data: *u8, data_size: usize,
+                                                       features: *BitstreamFeatures,
+                                                       version: int) -> int
+
+// ## Decoding
+//
+// Both of these answer storage the **library** allocated, released with `free` below, or null where
+// anything at all went wrong. Null is the whole of the diagnosis: a truncated file, a corrupt one,
+// an animation and an out-of-memory are one answer.
+extern "WebPDecodeRGBA" decode_rgba(data: *u8, data_size: usize,
+                                    width: *int, height: *int) -> *u8
+
+extern "WebPDecodeRGB" decode_rgb(data: *u8, data_size: usize,
+                                  width: *int, height: *int) -> *u8
+
+// The same decodes into storage the **caller** already has. `stride` is the distance in bytes
+// between one row and the next, so `out_size` must be at least `stride * height`. Answers
+// `out` on success and null on failure, including a destination that is too small.
+extern "WebPDecodeRGBAInto" decode_rgba_into(data: *u8, data_size: usize, out: *u8,
+                                             out_size: usize, stride: int) -> *u8
+
+extern "WebPDecodeRGBInto" decode_rgb_into(data: *u8, data_size: usize, out: *u8,
+                                           out_size: usize, stride: int) -> *u8
+
+// ## Encoding
+//
+// **The output pointer is an out-parameter and the length is the answer**, which is why these take
+// a `**u8`. A length of zero means the encode did not happen and nothing was allocated; anything
+// else means `out` holds a whole `.webp` file that `free` below releases.
+//
+// `quality` runs from 0 to 100 and libwebp refuses anything outside it — as it refuses a width or
+// height outside `1..16383` — by answering zero, so the layer above checks both first in order to
+// say which one it was.
+extern "WebPEncodeRGBA" encode_rgba(rgba: *u8, width: int, height: int, stride: int,
+                                    quality: f32, out: **u8) -> usize
+
+extern "WebPEncodeRGB" encode_rgb(rgb: *u8, width: int, height: int, stride: int,
+                                  quality: f32, out: **u8) -> usize
+
+// The lossless encoders take no quality, because there is nothing to trade.
+//
+// **They are not `exact`**: libwebp's default rewrites the colour of fully transparent pixels to
+// whatever compresses best, which is lossless about the image and not about the bytes. Reaching the
+// `exact` flag needs `WebPEncode` and a `WebPConfig`; see the module above.
+extern "WebPEncodeLosslessRGBA" encode_lossless_rgba(rgba: *u8, width: int, height: int,
+                                                     stride: int, out: **u8) -> usize
+
+extern "WebPEncodeLosslessRGB" encode_lossless_rgb(rgb: *u8, width: int, height: int,
+                                                   stride: int, out: **u8) -> usize
+
+// ## Releasing what the library allocated
+//
+// **`WebPFree` and not the platform's `free`.** They are the same call in every build anybody
+// ships, and keeping them apart is what stops this package depending on that: libwebp is entitled
+// to have been built against another allocator, and a decoder's pixels came out of whichever one it
+// was.
+extern "WebPFree" free(p: *u8)
+
+// ## The numbers, asked for rather than transcribed
+
+// The ABI version each header was compiled against. `get_features_internal` refuses a caller whose
+// number disagrees with the library's, which is upstream's guard against a program compiled against
+// one libwebp and linked against another.
+c const
+    DECODER_ABI_VERSION: int = "WEBP_DECODER_ABI_VERSION"
+    ENCODER_ABI_VERSION: int = "WEBP_ENCODER_ABI_VERSION"
+
+// `VP8StatusCode`, which is an `enum` rather than a set of `#define`s — read rather than
+// transcribed, so a renumbering upstream is a compile error here instead of a wrong sentence.
+c const
+    STATUS_OK:                  int = "VP8_STATUS_OK"
+    STATUS_OUT_OF_MEMORY:       int = "VP8_STATUS_OUT_OF_MEMORY"
+    STATUS_INVALID_PARAM:       int = "VP8_STATUS_INVALID_PARAM"
+    STATUS_BITSTREAM_ERROR:     int = "VP8_STATUS_BITSTREAM_ERROR"
+    STATUS_UNSUPPORTED_FEATURE: int = "VP8_STATUS_UNSUPPORTED_FEATURE"
+    STATUS_SUSPENDED:           int = "VP8_STATUS_SUSPENDED"
+    STATUS_USER_ABORT:          int = "VP8_STATUS_USER_ABORT"
+    STATUS_NOT_ENOUGH_DATA:     int = "VP8_STATUS_NOT_ENOUGH_DATA"
+
+// What the layer above lays over C's storage has to agree with the header, and these are what
+// `c/tests.sysl` checks it against.
+c const
+    SIZEOF_FEATURES: usize = "sizeof(WebPBitstreamFeatures)"
+
+    OFFSET_WIDTH:         usize = "offsetof(WebPBitstreamFeatures, width)"
+    OFFSET_HEIGHT:        usize = "offsetof(WebPBitstreamFeatures, height)"
+    OFFSET_HAS_ALPHA:     usize = "offsetof(WebPBitstreamFeatures, has_alpha)"
+    OFFSET_HAS_ANIMATION: usize = "offsetof(WebPBitstreamFeatures, has_animation)"
+    OFFSET_FORMAT:        usize = "offsetof(WebPBitstreamFeatures, format)"
+    OFFSET_PAD:           usize = "offsetof(WebPBitstreamFeatures, pad)"

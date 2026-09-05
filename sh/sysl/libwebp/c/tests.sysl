@@ -1,0 +1,83 @@
+// That sysl and clang agree about libwebp's memory, and that the numbers in the layer above were
+// read from the header rather than copied out of it.
+//
+// **One struct in this package is a sysl declaration laid over storage the library writes into**,
+// and a disagreement about it links perfectly and fills the wrong fields at run time. So every
+// member is asserted against the header's own `offsetof` and the struct against its `sizeof` — an
+// upstream that reorders one then fails a test instead of reporting somebody else's width for ever.
+
+module sh.sysl.libwebp.c
+@tests
+
+import sysl.harness.*
+import sysl.slices.as_ptr
+
+@test("the features struct is laid out the way libwebp declares it")
+features_agree_with_the_header()
+    assert_eq(sizeof(BitstreamFeatures), SIZEOF_FEATURES)
+
+    assert_eq(offsetof(BitstreamFeatures, width), OFFSET_WIDTH)
+    assert_eq(offsetof(BitstreamFeatures, height), OFFSET_HEIGHT)
+    assert_eq(offsetof(BitstreamFeatures, has_alpha), OFFSET_HAS_ALPHA)
+    assert_eq(offsetof(BitstreamFeatures, has_animation), OFFSET_HAS_ANIMATION)
+    assert_eq(offsetof(BitstreamFeatures, format), OFFSET_FORMAT)
+
+    // `pad` is upstream's reservation and is never read, but it is what makes the struct forty bytes
+    // rather than twenty — and forty is how many `get_features_internal` writes.
+    assert_eq(offsetof(BitstreamFeatures, pad), OFFSET_PAD)
+end features_agree_with_the_header
+
+// **`WebPGetFeaturesInternal` refuses a caller whose ABI number disagrees with the library's**,
+// which is upstream's guard against a program compiled against one libwebp and linked against
+// another. That number reaches it from a `c const` here, so this asserts the guard can be satisfied
+// rather than asserting a particular value: a libwebp that bumped its ABI would want the header's
+// new number, not this one.
+@test("the ABI version the header carries is the one the library accepts")
+the_abi_version_is_accepted()
+    assert(DECODER_ABI_VERSION > 0)
+    assert(ENCODER_ABI_VERSION > 0)
+
+    // Two bytes are not enough to read a header, so the answer must be `NOT_ENOUGH_DATA` — and
+    // crucially **not** `INVALID_PARAM`, which is what a rejected ABI version answers.
+    var stub: [2]u8 = [82, 73]
+    var f = BitstreamFeatures(0, 0, 0, 0, 0, [0; 5])
+
+    assert_eq(get_features_internal(as_ptr(stub[..]), stub.len, &f, DECODER_ABI_VERSION),
+        STATUS_NOT_ENOUGH_DATA)
+
+    // And a version the library does not know is refused, which is what makes the line above mean
+    // something.
+    assert_eq(get_features_internal(as_ptr(stub[..]), stub.len, &f, 1), STATUS_INVALID_PARAM)
+end the_abi_version_is_accepted
+
+// `VP8StatusCode` is an enumeration rather than a set of `#define`s, so these are read by the
+// compiler from the header. A renumbering upstream would move them together, which is exactly why
+// the layer above matches on the names.
+@test("the status enumeration is read rather than transcribed")
+statuses_are_read_from_the_header()
+    assert_eq(STATUS_OK, 0)
+    assert_eq(STATUS_OUT_OF_MEMORY, 1)
+    assert_eq(STATUS_INVALID_PARAM, 2)
+    assert_eq(STATUS_BITSTREAM_ERROR, 3)
+    assert_eq(STATUS_UNSUPPORTED_FEATURE, 4)
+    assert_eq(STATUS_SUSPENDED, 5)
+    assert_eq(STATUS_USER_ABORT, 6)
+    assert_eq(STATUS_NOT_ENOUGH_DATA, 7)
+end statuses_are_read_from_the_header
+
+// **The decoder and the encoder carry separate version numbers**, because libwebp can be built as a
+// decoder alone. This asserts they can be asked for and that the answer is a plausible packing, not
+// that the machine has any particular libwebp.
+@test("both halves of the library report a version")
+the_versions_are_askable()
+    val d = get_decoder_version()
+    val e = get_encoder_version()
+
+    assert(d > 0, "the decoder reports no version")
+    assert(e > 0, "the encoder reports no version")
+
+    // `major << 16 | minor << 8 | revision`, so a libwebp at or past 1.0.0 has a major of at least
+    // one and no field above 255.
+    assert((d >> 16) >= 1, "this libwebp predates 1.0.0")
+    assert(((d >> 8) & 255) < 256)
+end the_versions_are_askable

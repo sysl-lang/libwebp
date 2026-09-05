@@ -1,0 +1,53 @@
+// WebP for sysl — decoding and encoding, lossy and lossless, over the installed libwebp.
+//
+// This is the block a consumer writes to reach this package:
+//
+//     dependencies {
+//       libwebp { git = "github.com/sysl-lang/libwebp", version = "0.1.0" }
+//     }
+//
+// The coordinate is identity rather than a URL, so it carries no `https://`, and the version is the
+// tag `v0.1.0` on this repository.
+//
+// **libwebp has to be installed, and so do its headers.** Nothing is vendored: libwebp is a
+// quarter of a megabyte of C with its own CMake build, it carries hand-written SIMD for four
+// architectures, and every platform ships it as one package.
+//
+//     brew install webp            # macOS — the formula a consumer's own formula must depend_on
+//     sudo apt install libwebp-dev # Debian / Ubuntu
+//     sudo pacman -S libwebp       # Arch
+//
+// **The build needs no flags**, because libwebp installs `libwebp.pc` beside itself and the
+// `pkg_config` requirement below asks the machine where it is.
+
+package {
+  name    = "libwebp"
+  version = "0.1.0"
+
+  // The compiler this was written against and the only one it is known to build with. Lower it when
+  // somebody builds this with an older one — a floor is meant to be a fact rather than a guess.
+  sysl = "0.0.105"
+}
+
+// **`heap`, and libwebp is the one allocating.** `WebPDecodeRGBA` and `WebPEncodeRGBA` both hand
+// back storage the library malloc'd and the caller releases with `WebPFree`, and there is no
+// allocator hook in the public API to point at storage a program already owns — `WEBP_USE_MALLOC`
+// and friends are build-time macros of the library, not run-time parameters, so a binding setting
+// them would be pinned to a build of libwebp nobody has installed.
+//
+// So `Image` and `Encoded` are `Drop` types holding the library's pointer, which is the same shape
+// `sh.sysl.stb` uses and costs no copy. **`decode_rgba_into` is the way out for a caller who wants
+// none of that**: it decodes straight into a slice the program owns, allocates nothing, and is the
+// call to reach for in a loop over many frames.
+//
+// **No `posix`**: nothing here opens a file, reads a clock or touches a socket. A decode is
+// arithmetic over two buffers. The suite reaches `sysl.process` and `sysl.fs` to cross-check
+// against the `cwebp` and `dwebp` commands, which costs a consumer nothing — a `@tests` file's
+// needs are not the package's.
+requires {
+  heap = true
+
+  pkg_config {
+    libwebp = "libwebp — `brew install webp` on macOS, Debian's libwebp-dev, Arch's libwebp"
+  }
+}

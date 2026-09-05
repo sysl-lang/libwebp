@@ -1,0 +1,835 @@
+// What this package claims, checked against libwebp's own command line wherever a check could fail.
+//
+// **The honest limit on the corroboration is worth stating first.** `cwebp` and `dwebp` link the
+// same `libwebp` this package calls, so a file the two agree about says nothing about the *format*
+// — both would agree about a mistake in the library. What it does check, and what nothing else here
+// can, is the **binding**: that the width, the height, the stride and the quality reach the encoder
+// the caller asked for, that the pixels come back in the order the header promises, and that a
+// whole `.webp` file is what this package hands over rather than a fragment of one. Every one of
+// those is a defect that round-tripping against ourselves would pass.
+//
+// There is no from-scratch WebP encoder on this machine to be the second oracle qrcodegen's lesson
+// asks for — Pillow's WebP plugin and Chrome's decoder are both this same libwebp. The suite
+// therefore does not claim to have read the format; it claims to have driven the library correctly.
+//
+// **The cross-check is skipped rather than failed where the commands are not installed**, since a
+// machine can have the library without the tools.
+
+module sh.sysl.libwebp
+@tests
+
+import sysl.harness.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{read_bytes, write_bytes, remove_file, exists, make_temp_dir}
+import sysl.process.{run, Status}
+
+// -- What the suite encodes ------------------------------------------------------------------------
+
+// A smooth opaque gradient, four channels. **Every alpha is 255**, which matters: the lossless
+// encoder is allowed to rewrite the colour under a fully transparent pixel, so a fixture that has
+// none is the one an exact round trip can be asserted on.
+private gradient(w: int, h: int) -> []u8
+    var out: []u8 = [0; usize(w) * usize(h) * 4]
+
+    for y in 0..<usize(h)
+        for x in 0..<usize(w)
+            val i = (y * usize(w) + x) * 4
+
+            out[i] = u8((x * 4) % 256)
+            out[i + 1] = u8((y * 5) % 256)
+            out[i + 2] = u8(((x + y) * 3) % 256)
+            out[i + 3] = 255
+
+    out
+
+// The same three channels wide, which is what `encode_rgb` and `decode_rgb` take.
+private gradient_rgb(w: int, h: int) -> []u8
+    var out: []u8 = [0; usize(w) * usize(h) * 3]
+
+    for y in 0..<usize(h)
+        for x in 0..<usize(w)
+            val i = (y * usize(w) + x) * 3
+
+            out[i] = u8((x * 4) % 256)
+            out[i + 1] = u8((y * 5) % 256)
+            out[i + 2] = u8(((x + y) * 3) % 256)
+
+    out
+
+// A gradient with a real alpha channel, including a band of **fully transparent** pixels — which is
+// the band the `exact` caveat in the module doc is about.
+private with_alpha(w: int, h: int) -> []u8
+    var out = gradient(w, h)
+
+    for y in 0..<usize(h)
+        for x in 0..<usize(w)
+            val i = (y * usize(w) + x) * 4
+
+            out[i + 3] = if x < usize(w) / 4 then 0 else u8(64 + (x + y) % 192)
+
+    out
+
+// A gradient that does not wrap, so it has no discontinuity anywhere in it.
+//
+// **`gradient` is the wrong fixture for a lossy tolerance and finding out cost a run.** Its channels
+// are `(x * 4) % 256`, so every sixty-four pixels there is a hard step from 252 to 0 — and a lossy
+// coder rings at a step like that, moving a channel by 121 at quality 95 while being entirely
+// correct. A tolerance test needs an image a photograph could be.
+private smooth(w: int, h: int) -> []u8
+    var out: []u8 = [0; usize(w) * usize(h) * 4]
+
+    for y in 0..<usize(h)
+        for x in 0..<usize(w)
+            val i = (y * usize(w) + x) * 4
+
+            out[i] = u8(x * 200 / usize(w) + 20)
+            out[i + 1] = u8(y * 200 / usize(h) + 20)
+            out[i + 2] = u8((x + y) * 100 / (usize(w) + usize(h)) + 60)
+            out[i + 3] = 255
+
+    out
+
+// Detail rather than a gradient, from a xorshift so that the suite depends on no clock and on
+// nobody's random number generator.
+//
+// **This is the fixture the quality dial is visible on.** A smooth gradient compresses to almost
+// nothing at every quality libwebp offers, so a test asserting that a higher quality costs more
+// bytes would pass just as well on a binding that never passed the quality at all — which is the
+// mutation-pass lesson `~/dev/sysl-lang/CLAUDE.md` records against zstd, in this package's own
+// currency.
+private detail(w: int, h: int) -> []u8
+    var out: []u8 = [0; usize(w) * usize(h) * 4]
+    var s: u32 = 0x2545F491
+
+    for i in 0..<(usize(w) * usize(h))
+        s = s ^ (s << 13)
+        s = s ^ (s >> 17)
+        s = s ^ (s << 5)
+
+        val j = i * 4
+
+        // Half structure, half noise: pure noise defeats every codec and pure structure saturates
+        // every codec, and the interesting fixture is in the middle.
+        out[j] = u8(((i % 64) * 4 + usize(s & 63)) % 256)
+        out[j + 1] = u8(((i / 64) * 3 + usize((s >> 8) & 63)) % 256)
+        out[j + 2] = u8(usize((s >> 16) & 255))
+        out[j + 3] = 255
+
+    out
+
+// -- Round trips -----------------------------------------------------------------------------------
+
+// **Lossless has to mean every byte**, and this is the test that says so. The fixture is opaque, so
+// the `exact` caveat has nothing to bite on and the comparison can be the whole buffer.
+@test("a lossless round trip returns the pixels byte for byte")
+lossless_is_exact()
+    val src = gradient(64, 48)
+
+    val file = encode_lossless_rgba(src, 64, 48).unwrap()
+    val back = decode_rgba(file.bytes()).unwrap()
+
+    assert_eq(back.width, 64)
+    assert_eq(back.height, 48)
+    assert_eq(back.channels, 4)
+    assert_eq(back.len(), src.len)
+
+    assert_slice_eq(back.pixels(), src, "a lossless round trip changed a byte")
+end lossless_is_exact
+
+@test("a three-channel lossless round trip returns the pixels byte for byte")
+lossless_rgb_is_exact()
+    val src = gradient_rgb(40, 24)
+
+    val file = encode_lossless_rgb(src, 40, 24).unwrap()
+    val back = decode_rgb(file.bytes()).unwrap()
+
+    assert_eq(back.width, 40)
+    assert_eq(back.height, 24)
+    assert_eq(back.channels, 3)
+
+    assert_slice_eq(back.pixels(), src, "a lossless RGB round trip changed a byte")
+end lossless_rgb_is_exact
+
+// **The alpha channel comes back exactly and the colour under `alpha == 0` need not**, which is
+// libwebp's default rather than a defect: with `exact` off it rewrites invisible pixels to whatever
+// compresses best. This pins both halves, so the day upstream changes its mind a test goes red.
+@test("alpha survives a lossless round trip exactly, and the colour under a zero alpha may not")
+alpha_survives_losslessly()
+    val src = with_alpha(48, 32)
+
+    val file = encode_lossless_rgba(src, 48, 32).unwrap()
+    val back = decode_rgba(file.bytes()).unwrap()
+
+    val px = back.pixels()
+
+    var invisible = 0
+
+    for i in 0..<(48 * 32)
+        val j = usize(i) * 4
+
+        assert_eq(px[j + 3], src[j + 3], "an alpha value did not survive a lossless round trip")
+
+        if src[j + 3] == 0
+            invisible = invisible + 1
+        else
+            assert_eq(px[j], src[j], "a visible red did not survive a lossless round trip")
+            assert_eq(px[j + 1], src[j + 1], "a visible green did not survive")
+            assert_eq(px[j + 2], src[j + 2], "a visible blue did not survive")
+
+    assert(invisible > 0, "the fixture has no transparent pixels, so it checks nothing")
+end alpha_survives_losslessly
+
+// A lossy round trip keeps the shape exactly and the pixels approximately, and **the second half
+// has to be asserted or the first one is all the test says**.
+@test("a lossy round trip keeps the dimensions exactly and the pixels close")
+lossy_is_close()
+    val src = smooth(64, 48)
+
+    val file = encode_rgba(src, 64, 48, 95.0).unwrap()
+    val back = decode_rgba(file.bytes()).unwrap()
+
+    assert_eq(back.width, 64)
+    assert_eq(back.height, 48)
+    assert_eq(back.len(), src.len)
+
+    val px = back.pixels()
+
+    var worst = 0
+
+    for i in 0..<src.len
+        val d = if px[i] > src[i] then int(px[i]) - int(src[i]) else int(src[i]) - int(px[i])
+
+        if d > worst then worst = d
+
+    assert(worst <= 12, f"a quality-95 round trip moved a channel by $worst%d, which is too far")
+
+    // And it really is lossy: a fixture with detail in it does not come back unchanged, so the
+    // exactness asserted above for the lossless calls is a claim about *them*.
+    val noisy = detail(64, 48)
+    val lossy = decode_rgba(encode_rgba(noisy, 64, 48, 80.0).unwrap().bytes()).unwrap()
+
+    assert(lossy.pixels() != noisy, "a quality-80 encode returned the pixels unchanged")
+end lossy_is_close
+
+// -- The parameters actually reach libwebp -----------------------------------------------------------
+
+// **The strict inequality is the point.** A binding that dropped the quality on the floor would
+// encode everything at libwebp's default and still satisfy `<=`; only `<` says the number arrived.
+@test("the quality reaches the encoder: a higher one is strictly larger")
+quality_reaches_the_encoder()
+    val src = detail(96, 96)
+
+    val poor = encode_rgba(src, 96, 96, 5.0).unwrap()
+    val good = encode_rgba(src, 96, 96, 95.0).unwrap()
+
+    assert(poor.len() < good.len(),
+        f"quality 5 came to ${poor.len()}%d bytes and quality 95 to ${good.len()}%d")
+
+    // And the two really are different files rather than the same one twice.
+    assert(poor.bytes() != good.bytes(), "two qualities produced identical bytes")
+end quality_reaches_the_encoder
+
+// **`stride` is the parameter a round trip cannot see**, because a packed image and a padded one
+// decode to the same pixels — which is exactly why it needs its own test. The padded rows here hold
+// a value nothing else in the image does, so a binding that ignored the stride would read that
+// padding as picture and the comparison would fail.
+@test("the row stride reaches the encoder, so padded rows are not read as picture")
+stride_reaches_the_encoder()
+    val w = 32
+    val h = 20
+    val pad = 17
+
+    val src = gradient(w, h)
+    val row = w * 4 + pad
+
+    var padded: []u8 = [0xA5; usize(row) * usize(h)]
+
+    for y in 0..<usize(h)
+        for i in 0..<usize(w * 4)
+            padded[y * usize(row) + i] = src[y * usize(w * 4) + i]
+
+    val file = encode_lossless_rgba(padded, w, h, row).unwrap()
+    val back = decode_rgba(file.bytes()).unwrap()
+
+    assert_slice_eq(back.pixels(), src, "the stride did not reach the encoder")
+
+    // A stride shorter than a packed row is a caller's mistake and is refused rather than passed on.
+    assert(is_shape(encode_lossless_rgba(padded, w, h, w * 4 - 1).unwrap_err()),
+        "a stride narrower than the image was accepted")
+end stride_reaches_the_encoder
+
+// -- Reading a header ------------------------------------------------------------------------------
+
+@test("probe reads the shape, the alpha and the coder out of the header")
+probe_reads_the_header()
+    val opaque = encode_lossless_rgba(gradient(70, 30), 70, 30).unwrap()
+
+    val a = probe(opaque.bytes()).unwrap()
+
+    assert_eq(a.width, 70)
+    assert_eq(a.height, 30)
+    assert_eq(a.animated, false)
+    assert_eq(a.format, Format.Lossless)
+    assert_eq(a.rgba_len(), usize(70 * 30 * 4))
+    assert_eq(a.rgb_len(), usize(70 * 30 * 3))
+
+    // A lossy encode says so, which is how the two coders are told apart without decoding either.
+    val lossy = encode_rgba(with_alpha(70, 30), 70, 30, 60.0).unwrap()
+
+    val b = probe(lossy.bytes()).unwrap()
+
+    assert_eq(b.width, 70)
+    assert_eq(b.height, 30)
+    assert_eq(b.format, Format.Lossy)
+    assert(b.has_alpha, "an image encoded from pixels with transparency lost its alpha")
+
+    // Three channels in means no alpha out, whichever coder wrote it.
+    val flat = encode_lossless_rgb(gradient_rgb(16, 16), 16, 16).unwrap()
+
+    assert_eq(probe(flat.bytes()).unwrap().has_alpha, false)
+end probe_reads_the_header
+
+// **A header is a few dozen bytes and `probe` reads no more than that**, which is what makes it the
+// call to reach for before deciding whether to decode a file at all. This asserts it by handing it
+// a prefix: the dimensions come back from bytes that do not contain the image.
+@test("probe answers from the header alone, on a file whose image is not all there")
+probe_costs_only_the_header()
+    // **A gradient is the wrong fixture here.** VP8L's predictor turns 200 x 150 of one into
+    // eighty-odd bytes, so a "prefix" of it would be most of the file and the test would say
+    // nothing. This one has detail in it and comes to tens of kilobytes.
+    val whole = encode_lossless_rgba(detail(200, 150), 200, 150).unwrap()
+
+    assert(whole.len() > 1000, "the fixture is too small for this test to mean anything")
+
+    val head = whole.bytes()[0..<40]
+
+    val info = probe(head).unwrap()
+
+    assert_eq(info.width, 200)
+    assert_eq(info.height, 150)
+
+    // And the decoders do **not** accept the same prefix, which is the distinction this package
+    // exists to draw: `probe` answers what the header says, a decode answers whether there is an
+    // image.
+    assert(is_truncated(decode_rgba(head).unwrap_err()),
+        "forty bytes of a file decoded as though the image were there")
+end probe_costs_only_the_header
+
+@test("is_webp reads the container header and nothing else")
+is_webp_reads_the_container()
+    val file = encode_lossless_rgba(gradient(8, 8), 8, 8).unwrap()
+
+    assert(is_webp(file.bytes()))
+
+    // The first twelve bytes are the whole of the question, so a file cut to them still answers.
+    assert(is_webp(file.bytes()[0..<12]))
+
+    assert(!is_webp(file.bytes()[0..<11]), "eleven bytes cannot hold a RIFF header")
+    assert(!is_webp([]))
+    assert(!is_webp([82, 73, 70, 70, 0, 0, 0, 0, 80, 78, 71, 32]))
+end is_webp_reads_the_container
+
+// -- The error paths -------------------------------------------------------------------------------
+
+private is_truncated(e: Error) -> bool = e match
+    Truncated -> true
+    _         -> false
+
+private is_not_webp(e: Error) -> bool = e match
+    NotWebP -> true
+    _       -> false
+
+private is_animated(e: Error) -> bool = e match
+    Animated -> true
+    _        -> false
+
+private is_shape(e: Error) -> bool = e match
+    Shape(_) -> true
+    _        -> false
+
+private is_dimensions(e: Error) -> bool = e match
+    Dimensions(_, _) -> true
+    _                -> false
+
+private is_quality(e: Error) -> bool = e match
+    Quality(_) -> true
+    _          -> false
+
+// **A partial download and a corrupt file are different things to whatever is retrying**, and
+// libwebp answers one null pointer to both. This is the distinction this package adds, so it is the
+// one worth testing hardest: every prefix of a real file that still carries a header must say
+// `Truncated`, not `Corrupt`.
+@test("a truncated file is truncated, at every prefix of it")
+truncation_is_not_corruption()
+    val whole = encode_lossless_rgba(detail(64, 64), 64, 64).unwrap()
+
+    assert(whole.len() > 200, "the fixture is too small for this test to mean anything")
+
+    var checked = 0
+
+    for cut in [whole.len() / 4, whole.len() / 2, whole.len() * 3 / 4, whole.len() - 1]
+        val part = whole.bytes()[0..<cut]
+
+        // A prefix short enough to lose the header says `Truncated` too, from libwebp's own status.
+        assert(is_truncated(decode_rgba(part).unwrap_err()),
+            f"a $cut%d-byte prefix of a file was not reported as truncated")
+
+        assert(is_truncated(decode_rgb(part).unwrap_err()))
+
+        checked = checked + 1
+
+    assert_eq(checked, 4)
+
+    // And the whole file is not truncated, so the check above is capable of passing for the right
+    // reason rather than always firing.
+    assert(decode_rgba(whole.bytes()).is_ok())
+end truncation_is_not_corruption
+
+@test("bytes that were never a WebP are refused as such")
+garbage_is_refused()
+    // Enough bytes for libwebp to be sure, and none of them a header.
+    var junk: [64]u8 = [7; 64]
+
+    assert(is_not_webp(probe(junk[..]).unwrap_err()))
+    assert(is_not_webp(decode_rgba(junk[..]).unwrap_err()))
+    assert(is_not_webp(decode_rgb(junk[..]).unwrap_err()))
+
+    // **Two bytes are `Truncated` rather than `NotWebP`**, and the difference is the whole point:
+    // libwebp will not say what bytes are *not* until it has seen enough of them, and a caller
+    // reading a socket needs that answer rather than a verdict.
+    var stub: [2]u8 = [82, 73]
+
+    assert(is_truncated(probe(stub[..]).unwrap_err()))
+
+    assert(is_truncated(probe([]).unwrap_err()))
+end garbage_is_refused
+
+// A RIFF container that says `WEBP` and holds a `VP8X` chunk with the animation bit set, wrapped
+// around a still this package encoded.
+//
+// **It is built here rather than carried as a fixture** because the whole of what the test needs is
+// the flag: `WebPGetFeatures` reads `has_animation` straight out of that byte, and
+// `WebPDecodeRGBA` refuses anything carrying it. `webpinfo` accepts the result as a well-formed
+// animation, which is the check that this is a fair test rather than a malformed file being
+// refused for the wrong reason.
+private animation_of(still: []const u8, w: int, h: int) -> Buf[u8]
+    var body: Buf[u8] = buf()
+
+    // The frame rectangle, its duration and its blending flags, then the still's own chunks — which
+    // are everything after the twelve-byte RIFF header.
+    push_u24(&body, 0)
+    push_u24(&body, 0)
+    push_u24(&body, w - 1)
+    push_u24(&body, h - 1)
+    push_u24(&body, 100)
+
+    body.push(0)
+    body.extend(still[12..<still.len])
+
+    var payload: Buf[u8] = buf()
+
+    payload.extend("WEBP".bytes)
+
+    // `VP8X`: the feature flags, then the canvas size. 0x12 is alpha and animation.
+    payload.extend("VP8X".bytes)
+    push_u32(&payload, 10)
+    payload.extend([0x12, 0, 0, 0])
+    push_u24(&payload, w - 1)
+    push_u24(&payload, h - 1)
+
+    // `ANIM`: a background colour and a loop count.
+    payload.extend("ANIM".bytes)
+    push_u32(&payload, 6)
+    payload.extend([255, 255, 255, 255, 0, 0])
+
+    // `ANMF`: the one frame.
+    payload.extend("ANMF".bytes)
+    push_u32(&payload, body.len())
+    payload.extend(body.view())
+
+    if body.len() % 2 == 1 then payload.push(0)
+
+    var out: Buf[u8] = buf()
+
+    out.extend("RIFF".bytes)
+    push_u32(&out, payload.len())
+    out.extend(payload.view())
+
+    out
+end animation_of
+
+private push_u24(out: *Buf[u8], n: int)
+    out.push(u8(n & 255))
+    out.push(u8((n >> 8) & 255))
+    out.push(u8((n >> 16) & 255))
+
+private push_u32(out: *Buf[u8], n: usize)
+    out.push(u8(n & 255))
+    out.push(u8((n >> 8) & 255))
+    out.push(u8((n >> 16) & 255))
+    out.push(u8((n >> 24) & 255))
+
+// **An animation is refused, and the refusal says what is missing.** libwebp answers a bare null
+// pointer to one, which would arrive here as `Corrupt` and send a caller looking for a damaged file
+// that is not damaged at all.
+@test("an animated WebP is refused with a reason, and probe still describes it")
+animation_is_refused_with_a_reason()
+    val still = encode_lossless_rgba(gradient(64, 48), 64, 48).unwrap()
+
+    val anim = animation_of(still.bytes(), 64, 48)
+
+    // `probe` answers: this is how a caller tells an animation from a failure.
+    val info = probe(anim.view()).unwrap()
+
+    assert(info.animated, "the fixture is not an animation, so this test checks nothing")
+    assert_eq(info.width, 64)
+    assert_eq(info.height, 48)
+    assert_eq(info.format, Format.Mixed)
+
+    // Every decode refuses it, and says why.
+    assert(is_animated(decode_rgba(anim.view()).unwrap_err()))
+    assert(is_animated(decode_rgb(anim.view()).unwrap_err()))
+
+    var dst: []u8 = [0; usize(64 * 48 * 4)]
+
+    assert(is_animated(decode_rgba_into(anim.view(), dst).unwrap_err()))
+
+    assert_eq(Error.Animated.message(),
+        "this is an animated WebP; reading one needs libwebpdemux, which this package does not bind")
+
+    // And the still it was built around is not refused, so the refusal is about the container
+    // rather than about the frame inside it.
+    assert(decode_rgba(still.bytes()).is_ok())
+end animation_is_refused_with_a_reason
+
+@test("an encode checks the dimensions against what the format can hold")
+encode_checks_the_dimensions()
+    val px = gradient(4, 4)
+
+    assert(is_dimensions(encode_rgba(px, 0, 4).unwrap_err()))
+    assert(is_dimensions(encode_rgba(px, 4, 0).unwrap_err()))
+    assert(is_dimensions(encode_rgba(px, -1, 4).unwrap_err()))
+    assert(is_dimensions(encode_lossless_rgba(px, 4, max_dimension() + 1).unwrap_err()))
+    assert(is_dimensions(encode_rgb(px, max_dimension() + 1, 1).unwrap_err()))
+
+    // **The bound is the format's and it is inclusive**, so the largest legal side really encodes.
+    // One row of it is 64 KB of pixels rather than a gigabyte, which is what makes this affordable.
+    val strip = encode_lossless_rgba(gradient(max_dimension(), 1), max_dimension(), 1).unwrap()
+
+    assert_eq(probe(strip.bytes()).unwrap().width, max_dimension())
+end encode_checks_the_dimensions
+
+// libwebp is never told how long an input slice is — the length is implied by the width, the height
+// and the stride — so a slice shorter than the shape describes would be read past its end, and this
+// is the check that stops it.
+@test("an encode checks the pixels against the shape they are said to have")
+encode_checks_the_pixels()
+    val px = gradient(16, 16)
+
+    assert(encode_lossless_rgba(px, 16, 16).is_ok())
+
+    assert(is_shape(encode_lossless_rgba(px, 16, 17).unwrap_err()))
+    assert(is_shape(encode_rgba(px, 17, 16).unwrap_err()))
+    assert(is_shape(encode_rgba(px[0..<(px.len - 1)], 16, 16).unwrap_err()))
+
+    // Three channels of the same pixels is a smaller requirement, so the same slice is plenty.
+    assert(encode_lossless_rgb(px, 16, 16).is_ok())
+
+    // And `needed` is the figure that would actually work.
+    val e = encode_rgba(px, 16, 17).unwrap_err()
+
+    val needed = e match
+        Shape(n) -> n
+        _        -> 0usize
+
+    assert_eq(needed, usize(16 * 17 * 4))
+end encode_checks_the_pixels
+
+// libwebp answers a bare zero to a quality outside 0..100, exactly as it does to a bad width.
+// Checking here first is the only thing that lets the two be told apart.
+@test("an encode checks the quality, which libwebp would refuse without saying why")
+encode_checks_the_quality()
+    val px = gradient(8, 8)
+
+    assert(is_quality(encode_rgba(px, 8, 8, -1.0).unwrap_err()))
+    assert(is_quality(encode_rgba(px, 8, 8, 101.0).unwrap_err()))
+    assert(is_quality(encode_rgb(px, 8, 8, 200.0).unwrap_err()))
+
+    // Both ends of the range are legal.
+    assert(encode_rgba(px, 8, 8, 0.0).is_ok())
+    assert(encode_rgba(px, 8, 8, 100.0).is_ok())
+end encode_checks_the_quality
+
+// -- Decoding into a caller's own slice ---------------------------------------------------------------
+
+// **This is the call that allocates nothing**, so it is the one a loop over many frames wants — and
+// it has to agree with the allocating one pixel for pixel or it is a second decoder rather than the
+// same one.
+@test("decoding into a caller's slice gives the same pixels as decoding into libwebp's")
+decode_into_agrees()
+    val src = gradient(50, 40)
+    val file = encode_lossless_rgba(src, 50, 40).unwrap()
+
+    var dst: []u8 = [0; usize(50 * 40 * 4)]
+
+    val info = decode_rgba_into(file.bytes(), dst).unwrap()
+
+    assert_eq(info.width, 50)
+    assert_eq(info.height, 40)
+    assert_slice_eq(dst, src, "the caller-slice decode disagreed with the source")
+
+    assert_slice_eq(dst, decode_rgba(file.bytes()).unwrap().pixels(),
+        "the two decoders disagreed")
+
+    // Three channels, into a slice sized for three.
+    var narrow: []u8 = [0; usize(50 * 40 * 3)]
+
+    assert_eq(decode_rgb_into(file.bytes(), narrow).unwrap().height, 40)
+
+    assert_slice_eq(narrow, decode_rgb(file.bytes()).unwrap().pixels())
+end decode_into_agrees
+
+@test("decoding into a caller's slice checks the slice, and honours a stride")
+decode_into_checks_the_slice()
+    val file = encode_lossless_rgba(gradient(20, 10), 20, 10).unwrap()
+
+    var small: []u8 = [0; usize(20 * 10 * 4) - 1]
+
+    assert(is_shape(decode_rgba_into(file.bytes(), small).unwrap_err()))
+
+    // A stride narrower than a packed row is a caller's mistake.
+    var right: []u8 = [0; usize(20 * 10 * 4)]
+
+    assert(is_shape(decode_rgba_into(file.bytes(), right, 20 * 4 - 1).unwrap_err()))
+
+    // A wider one is legal, and the gap between rows is left alone — which is what a caller
+    // decoding into the middle of a larger canvas is relying on.
+    val row = 20 * 4 + 12
+
+    var wide: []u8 = [0x5A; usize(row) * 10]
+
+    assert_eq(decode_rgba_into(file.bytes(), wide, row).unwrap().width, 20)
+
+    val src = gradient(20, 10)
+
+    for y in 0..<usize(10)
+        for i in 0..<usize(20 * 4)
+            assert_eq(wide[y * usize(row) + i], src[y * usize(20 * 4) + i],
+                "a strided decode put a pixel in the wrong place")
+
+        for i in usize(20 * 4)..<usize(row)
+            assert_eq(wide[y * usize(row) + i], 0x5A,
+                "a strided decode wrote into the gap between rows")
+end decode_into_checks_the_slice
+
+// -- Three channels are three channels ---------------------------------------------------------------
+
+@test("decoding to three channels drops the alpha rather than compositing it")
+rgb_drops_the_alpha()
+    val src = with_alpha(24, 16)
+
+    val file = encode_lossless_rgba(src, 24, 16).unwrap()
+
+    val four = decode_rgba(file.bytes()).unwrap()
+    val three = decode_rgb(file.bytes()).unwrap()
+
+    assert_eq(three.channels, 3)
+    assert_eq(three.len(), usize(24 * 16 * 3))
+
+    val a = four.pixels()
+    val b = three.pixels()
+
+    for i in 0..<usize(24 * 16)
+        // Only where the pixel is visible: the colour under a zero alpha is the encoder's to
+        // rewrite, which `alpha_survives_losslessly` is the test for.
+        if src[i * 4 + 3] != 0
+            assert_eq(b[i * 3], a[i * 4], "red differs between the three- and four-channel decodes")
+            assert_eq(b[i * 3 + 1], a[i * 4 + 1], "green differs")
+            assert_eq(b[i * 3 + 2], a[i * 4 + 2], "blue differs")
+end rgb_drops_the_alpha
+
+// -- What the library is -----------------------------------------------------------------------------
+
+@test("the version is reported as a sentence and as a number, and they agree")
+the_version_agrees_with_itself()
+    val n = decoder_version()
+
+    assert(n > 0)
+
+    assert_eq(version(), f"${(n >> 16) & 255}%d.${(n >> 8) & 255}%d.${n & 255}%d")
+
+    assert(encoder_version() > 0, "this libwebp has no encoder, so most of this package is dead")
+
+    assert_eq(max_dimension(), 16383)
+end the_version_agrees_with_itself
+
+// **A `Drop` fires when a box's strong count reaches zero and for nothing else**, so a constructor
+// answering a plain value would leak libwebp's storage on every call while every test above stayed
+// green. Nothing in a suite notices that — the pixels are still right — which is why the real
+// measurement is a resident-set reading over a long loop and lives in the README.
+//
+// What this test can say is that the loop runs at all: two thousand handles taken and dropped, each
+// one a decode and an encode, with the answer checked so that nothing is optimised away. Under
+// AddressSanitizer it is also where a double free would surface.
+@test("the handles are boxed, so two thousand of them come and go")
+the_handles_are_boxed()
+    val src = gradient(16, 16)
+
+    var total = 0usize
+
+    for _ in 0..<2000
+        val file = encode_lossless_rgba(src, 16, 16).unwrap()
+        val back = decode_rgba(file.bytes()).unwrap()
+
+        total = total + back.len()
+
+    assert_eq(total, usize(2000 * 16 * 16 * 4))
+end the_handles_are_boxed
+
+// -- Against libwebp's own command line ----------------------------------------------------------------
+
+// Where one of libwebp's commands is, or an empty string where it is not installed.
+private webp_command(name: string) -> string
+    for dir in ["/opt/homebrew/bin/", "/usr/local/bin/", "/usr/bin/"]
+        if exists(dir + name) then return dir + name
+
+    ""
+
+// A binary PPM, which is the one image format both `cwebp` and this suite can write in a dozen
+// lines — `P6`, the dimensions, the maximum value, then the rows packed.
+private ppm(pixels: []const u8, w: int, h: int) -> Buf[u8]
+    var out: Buf[u8] = buf()
+
+    out.extend(f"P6\n$w%d $h%d\n255\n".bytes)
+    out.extend(pixels)
+
+    out
+
+// The pixels out of a binary PPM, which is what `dwebp -ppm` writes. The header is three
+// newline-terminated lines and the rest is the image.
+private ppm_pixels(file: []const u8) -> []const u8
+    var seen = 0
+    var i = 0usize
+
+    while i < file.len && seen < 3
+        if file[i] == 10 then seen = seen + 1
+
+        i = i + 1
+
+    file[i..<file.len]
+
+// **This is the corroboration that could actually fail.** It is not a check of the *format* — the
+// commands link the same `libwebp` — but of everything this package does around it: the dimensions
+// and the stride it passes, the channel order it promises, and whether what it hands back is a
+// whole file.
+@test("the cwebp and dwebp commands read what this package writes, and the other way round")
+the_command_line_agrees()
+    val cwebp = webp_command("cwebp")
+    val dwebp = webp_command("dwebp")
+
+    if cwebp == "" || dwebp == ""
+        skip("cwebp and dwebp are not both installed on this machine")
+
+        return
+
+    val dir = make_temp_dir("sysl-libwebp").unwrap()
+
+    val source = dir + "/source.ppm"
+    val ours = dir + "/ours.webp"
+    val theirs = dir + "/theirs.webp"
+    val back = dir + "/back.ppm"
+
+    val w = 64
+    val h = 48
+    val src = gradient_rgb(w, h)
+
+    // Ours out, theirs in. A lossless file, so `dwebp` must reproduce the input exactly rather
+    // than approximately — which makes this an equality rather than a tolerance.
+    write_bytes(ours, encode_lossless_rgb(src, w, h).unwrap().bytes()).unwrap()
+
+    assert_eq(run(dwebp, [ours, "-ppm", "-o", back]).unwrap(), Status.Exited(0),
+        "the dwebp command refused a file this package produced")
+
+    assert_slice_eq(ppm_pixels(read_bytes(back).unwrap()), src,
+        "dwebp decoded our file to different pixels")
+
+    // Theirs out, ours in.
+    write_bytes(source, ppm(src, w, h).view()).unwrap()
+    remove_file(theirs)
+
+    assert_eq(run(cwebp, ["-quiet", "-lossless", source, "-o", theirs]).unwrap(), Status.Exited(0),
+        "the cwebp command would not encode the suite's fixture")
+
+    val made = read_bytes(theirs).unwrap()
+
+    assert(is_webp(made))
+
+    val info = probe(made).unwrap()
+
+    assert_eq(info.width, w)
+    assert_eq(info.height, h)
+    assert_eq(info.format, Format.Lossless)
+
+    assert_slice_eq(decode_rgb(made).unwrap().pixels(), src,
+        "this package decoded cwebp's file to different pixels")
+
+    remove_file(source)
+    remove_file(ours)
+    remove_file(theirs)
+    remove_file(back)
+end the_command_line_agrees
+
+// The quality dial is the parameter most easily dropped on the floor, so it is worth asking a
+// second implementation of the *command* to agree that ours behaves like theirs: a file this
+// package writes at a low quality is smaller than one `cwebp` writes at a high one, and the other
+// way round.
+@test("the cwebp command and this package move the same way with the quality")
+the_command_line_agrees_about_quality()
+    val cwebp = webp_command("cwebp")
+
+    if cwebp == ""
+        skip("the cwebp command is not installed on this machine")
+
+        return
+
+    val dir = make_temp_dir("sysl-libwebp-q").unwrap()
+
+    val source = dir + "/source.ppm"
+    val low = dir + "/low.webp"
+    val high = dir + "/high.webp"
+
+    val w = 96
+    val h = 96
+
+    // A three-channel version of the fixture the quality is visible on.
+    var rgb: []u8 = [0; usize(w) * usize(h) * 3]
+
+    val rgba = detail(w, h)
+
+    for i in 0..<(usize(w) * usize(h))
+        rgb[i * 3] = rgba[i * 4]
+        rgb[i * 3 + 1] = rgba[i * 4 + 1]
+        rgb[i * 3 + 2] = rgba[i * 4 + 2]
+
+    write_bytes(source, ppm(rgb, w, h).view()).unwrap()
+
+    assert_eq(run(cwebp, ["-quiet", "-q", "10", source, "-o", low]).unwrap(), Status.Exited(0))
+    assert_eq(run(cwebp, ["-quiet", "-q", "90", source, "-o", high]).unwrap(), Status.Exited(0))
+
+    val theirs_low = read_bytes(low).unwrap().len
+    val theirs_high = read_bytes(high).unwrap().len
+
+    val ours_low = encode_rgb(rgb, w, h, 10.0).unwrap().len()
+    val ours_high = encode_rgb(rgb, w, h, 90.0).unwrap().len()
+
+    assert(theirs_low < theirs_high, "cwebp did not get larger with the quality on this fixture")
+
+    // The same input, the same library, the same two qualities: the files should be the same size
+    // to within the header bytes the command adds.
+    assert_eq(ours_low, theirs_low, "our quality-10 file is a different size from cwebp's")
+    assert_eq(ours_high, theirs_high, "our quality-90 file is a different size from cwebp's")
+
+    remove_file(source)
+    remove_file(low)
+    remove_file(high)
+end the_command_line_agrees_about_quality

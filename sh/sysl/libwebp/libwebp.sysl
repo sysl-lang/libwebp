@@ -1,0 +1,505 @@
+// WebP for sysl — decoding and encoding, lossy and lossless, over the libwebp the platform ships.
+//
+// **WebP is the format that made "PNG or JPEG?" stop being the question for the web.** Its lossy
+// mode is VP8's intra coder and comes out roughly a quarter smaller than a JPEG of the same quality;
+// its lossless mode beats PNG by about a fifth and, unlike PNG, carries alpha in the lossy mode too.
+// `sh.sysl.stb` is the package for PNG, JPEG, BMP, TGA and HDR; `sh.sysl.png` is the one for PNG on
+// its own. This is the one for anything a browser is going to fetch.
+//
+// ## The four calls
+//
+//     import sh.sysl.libwebp.*
+//
+//     val info = probe(bytes)?                       // width, height, alpha — from the header alone
+//     val img  = decode_rgba(bytes)?                 // &Image; img.pixels() is width*height*4 bytes
+//     val out  = encode_rgba(px, 640, 480, 80.0)?    // &Encoded; out.bytes() is a whole .webp file
+//     val same = encode_lossless_rgba(px, 640, 480)? // the same, with nothing thrown away
+//
+// `probe` reads the header and nothing else, so it is the call to make before deciding whether to
+// decode something at all — a hostile 16383 × 16383 image is a gigabyte of RGBA, and finding that
+// out should not cost a gigabyte.
+//
+// ## Who owns the pixels
+//
+// **libwebp allocates, and `Image` and `Encoded` are the handles that release it.** Both one-shot
+// families answer storage the library malloc'd, and there is no allocator hook in libwebp's public
+// API to point at storage a program already owns — the `WEBP_USE_*` knobs are build-time macros of
+// the library rather than run-time parameters, so a binding setting them would be pinned to a build
+// of libwebp nobody has installed. So the handles hold the library's pointer, `pixels()` and
+// `bytes()` are views into it, and a `Drop` calls `WebPFree` when the handle goes. It is the shape
+// `sh.sysl.stb` uses for exactly the same reason, and it costs no copy.
+//
+// **A caller who wants none of that has `decode_rgba_into`**, which decodes straight into a slice
+// the program already owns and allocates nothing. It is the call for a loop over many frames, and
+// the one that would work with an arena.
+//
+// ## Animation is refused, and refused deliberately
+//
+// **An animated WebP is a container this package does not read.** Its frames live in `ANMF` chunks
+// that only `libwebpdemux` — a second library, a second header, and a second `pkg-config` name —
+// knows how to walk, and `WebPDecodeRGBA` on one simply answers null with no explanation at all.
+// So `probe` reports `animated`, every decode answers `Error.Animated`, and the sentence says what
+// is missing rather than leaving a caller with a bare failure. Adding it means binding `demux.h`'s
+// `WebPAnimDecoder`, which is a real piece of work and has not been asked for.
+//
+// ## What else is deliberately absent
+//
+// **The incremental decoder** (`WebPIDecoder`, `WebPIAppend`) — the shape for showing an image as it
+// arrives over a socket. Worth having, and it is a stateful handle with a different ownership story
+// from anything here.
+//
+// **`WebPEncode` and `WebPConfig`** — the fifty-odd knobs behind the one-shot encoders: the method,
+// the segment count, the filter strength, `near_lossless`, and `exact`. One of those is a real gap
+// rather than a knob: **the lossless encoders here are not `exact`**, so libwebp rewrites the colour
+// of fully transparent pixels to whatever compresses best. That is lossless about the *image* and
+// not about the *bytes*, and a caller round-tripping RGBA through this package gets its alpha back
+// exactly and may not get the RGB under `alpha == 0`. The suite pins that behaviour rather than
+// hiding it.
+//
+// **`WebPPicture`** and everything hanging off it — cropping, rescaling, the YUV conversions, and
+// `WebPPictureDistortion`'s PSNR/SSIM. `sh.sysl.stb`'s resizer covers the scaling case.
+//
+// **The mux** (`mux.h`) — assembling animations, ICC profiles, EXIF and XMP into a container. Same
+// second-library argument as the demuxer.
+
+module sh.sysl.libwebp
+
+import sh.sysl.libwebp.c
+import sysl.slices.{as_ptr, as_mut_ptr}
+
+// Why a decode or an encode did not happen.
+enum Error
+    // The bytes are not a WebP bitstream. libwebp read enough of them to be sure, which is a
+    // different answer from `Truncated` — those bytes may yet become a WebP when more arrive.
+    NotWebP
+
+    // The input stops before the image does. **A partial download rather than a corrupt one**, and
+    // the difference matters to whatever is retrying.
+    //
+    // Two things produce it: libwebp saying it has not seen enough bytes to read a header, and the
+    // RIFF header declaring a payload longer than the slice it was handed. The second is this
+    // package's own check, and it exists because a WebP whose *header* is complete and whose image
+    // data is cut off looks, to `WebPDecodeRGBA`, exactly like a corrupt one.
+    Truncated
+
+    // The bytes are a WebP and libwebp would not decode the image in them. A flipped byte, a
+    // damaged chunk, or a container this package understood and the decoder did not.
+    Corrupt
+
+    // An animated WebP. Reading one needs `libwebpdemux` and its `WebPAnimDecoder`, which is a
+    // second library and a second header; this package binds neither. `probe` still answers, so a
+    // caller can tell an animation from a failure before asking for pixels.
+    Animated
+
+    // A feature this build of libwebp will not decode. Rare on a library from a package manager,
+    // and distinct from `Corrupt` because nothing is wrong with the file.
+    Unsupported
+
+    // A width or a height outside `1..16383`, which is the largest a WebP canvas can be — the
+    // format stores each dimension in fourteen bits. Also what an encode of an empty image answers.
+    Dimensions(width: int, height: int)
+
+    // The caller's pixel slice and the caller's dimensions disagree. `needed` is how many bytes the
+    // width, the height, the channel count and the stride say there should be.
+    //
+    // libwebp is never told how long an input slice is — the length is implied by the shape — so a
+    // slice shorter than the shape describes would be read past its end. This is that check, made
+    // here rather than left for C to discover.
+    Shape(needed: usize)
+
+    // A quality outside `0..100`. libwebp answers a bare zero for this, exactly as it does for a bad
+    // width; checking first is what lets the two be told apart.
+    Quality(quality: f32)
+
+    // libwebp could not allocate. A full-size decode is `width * height * 4` bytes in one block, so
+    // this is reachable on a large image without anything being wrong.
+    NoMemory
+
+    // libwebp refused the encode and says nothing more about it. The shape and the quality have
+    // already been checked here, so what is left is the library's own — an image it could not fit
+    // in the format, or an internal limit.
+    Refused
+
+    // What went wrong, as a sentence.
+    message(self) -> string = self match
+        NotWebP -> "the bytes are not a WebP image"
+        Truncated -> "the WebP data stops before the image does"
+        Corrupt -> "the WebP image data is damaged"
+        Animated -> "this is an animated WebP; reading one needs libwebpdemux, which this package does not bind"
+        Unsupported -> "this build of libwebp will not decode a feature the image uses"
+        Dimensions(width, height) ->
+            f"$width%d x $height%d is outside the 1..16383 a WebP canvas can be"
+        Shape(needed) -> f"the pixels do not match the dimensions given — $needed%d bytes were needed"
+        Quality(quality) -> f"a quality of $quality is outside 0..100"
+        NoMemory -> "libwebp could not allocate the image"
+        Refused -> "libwebp would not encode an image of this shape"
+end Error
+
+impl Display for Error
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.message(), out, fmt)
+
+// Which of WebP's two coders the file uses.
+enum Format
+    // VP8 — the intra frame of a video codec, and what `cwebp` writes unless told otherwise.
+    Lossy
+
+    // VP8L — a wholly different coder, closer to PNG's ancestry: prediction, a colour transform and
+    // an entropy stage, with no quantisation anywhere.
+    Lossless
+
+    // The file does not say, or its parts disagree. **Every animation answers this**, because its
+    // frames need not all be the same kind.
+    Mixed
+
+    private[libwebp] name(self) -> string = self match
+        Lossy    -> "lossy"
+        Lossless -> "lossless"
+        Mixed    -> "mixed"
+end Format
+
+impl Display for Format
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.name(), out, fmt)
+
+private format_of(code: int) -> Format =
+    code match
+        1 -> Lossy
+        2 -> Lossless
+        _ -> Mixed
+
+// What the header says, without decoding anything.
+struct Info
+    width: int
+    height: int
+
+    // Whether the bitstream carries an alpha channel. **`decode_rgba` works either way** — an image
+    // without alpha decodes to an opaque one — so this is for deciding what to re-encode as, not
+    // for deciding which call to make.
+    has_alpha: bool
+
+    // Whether this is an animation. Every decode in this package refuses one; see `Error.Animated`.
+    animated: bool
+
+    format: Format
+
+    // How many bytes `decode_rgba` will produce for this image.
+    rgba_len(self) -> usize = usize(self.width) * usize(self.height) * 4
+
+    // How many bytes `decode_rgb` will produce for this image.
+    rgb_len(self) -> usize = usize(self.width) * usize(self.height) * 3
+end Info
+
+impl Display for Info
+    display(self, out: *Writer, fmt: FormatSpec)
+        val alpha = if self.has_alpha then ", alpha" else ""
+        val anim = if self.animated then ", animated" else ""
+
+        display_str(f"${self.width}%d x ${self.height}%d ${self.format}$alpha$anim", out, fmt)
+    end display
+end Info
+
+// ## What the library is
+
+// The libwebp actually linked, as `"1.6.0"`. Worth printing in a diagnostic.
+version() -> string
+    val v = c.get_decoder_version()
+
+    f"${(v >> 16) & 255}%d.${(v >> 8) & 255}%d.${v & 255}%d"
+
+// The decoder's version as libwebp packs it: `major << 16 | minor << 8 | revision`.
+decoder_version() -> int = c.get_decoder_version()
+
+// The encoder's, the same way. **They are separate numbers** because libwebp can be built as a
+// decoder alone (`libwebpdecoder`), in which case only the first of them exists.
+encoder_version() -> int = c.get_encoder_version()
+
+// The largest a WebP canvas can be on a side. The format stores each dimension in fourteen bits, so
+// this is 16383 and is a property of the format rather than of this build.
+max_dimension() -> int = 16383
+
+// ## Reading
+
+// Whether these bytes begin a RIFF container holding a WebP.
+//
+// **This is the twelve-byte header and nothing else** — `RIFF`, a length, `WEBP` — so it is cheap
+// and it is not a validation. `probe` is the call that asks libwebp whether the bitstream inside is
+// one it will read.
+is_webp(data: []const u8) -> bool
+    if data.len < 12 then return false
+
+    data[0] == 82 && data[1] == 73 && data[2] == 70 && data[3] == 70 &&
+        data[8] == 87 && data[9] == 69 && data[10] == 66 && data[11] == 80
+
+// Whether the RIFF header declares more payload than we were handed.
+//
+// **Only a file that starts with a RIFF header can be judged this way.** libwebp also accepts a bare
+// `VP8`/`VP8L` chunk with no container — the header says so, for internal purposes — and one of
+// those carries no declared length, so there is nothing to compare against and this answers `false`.
+private short_of_its_riff(data: []const u8) -> bool
+    if !is_webp(data) then return false
+
+    val declared = usize(data[4]) | (usize(data[5]) << 8) | (usize(data[6]) << 16) |
+        (usize(data[7]) << 24)
+
+    data.len < declared + 8
+
+// What libwebp's status means here.
+private fault(status: int) -> Error =
+    status match
+        c.STATUS_OUT_OF_MEMORY       -> NoMemory
+        c.STATUS_NOT_ENOUGH_DATA     -> Truncated
+        c.STATUS_UNSUPPORTED_FEATURE -> Unsupported
+        c.STATUS_BITSTREAM_ERROR     -> NotWebP
+        c.STATUS_INVALID_PARAM       -> NotWebP
+        _                            -> Corrupt
+
+// The width, the height and what the bitstream carries, from the header alone.
+//
+// Nothing is decoded, so a few dozen bytes of a file are enough and a hostile image costs nothing to
+// look at. **An animation answers here rather than failing** — `Info.animated` is how a caller tells
+// one from a file it can decode, and every decode below refuses it.
+//
+// **A truncated file whose header survived answers too**, with the right dimensions: that is
+// libwebp's behaviour and it is the useful one, since a caller streaming a download wants the shape
+// before the last byte arrives. The decoders are where truncation becomes an error.
+probe(data: []const u8) -> Result[Info, Error]
+    // **An empty slice is `Truncated` here and `INVALID_PARAM` in libwebp**, which would arrive as
+    // `NotWebP` — a verdict about bytes nobody has seen. A caller reading a socket has an empty
+    // buffer before it has anything else, and "not enough yet" is the true answer at that point.
+    if data.len == 0 then return Err(Truncated)
+
+    var f = c.BitstreamFeatures(0, 0, 0, 0, 0, [0; 5])
+
+    val status = c.get_features_internal(as_ptr(data), data.len, &f, c.DECODER_ABI_VERSION)
+
+    if status != c.STATUS_OK then return Err(fault(status))
+
+    Ok(Info(f.width, f.height, f.has_alpha != 0, f.has_animation != 0, format_of(f.format)))
+
+// What every decode below checks before it asks libwebp for pixels.
+//
+// **The order is the point.** `WebPDecodeRGBA` answers one null pointer to an animation, a
+// truncation, a corruption and an allocation failure alike, so anything that can be told apart has
+// to be told apart *first* — otherwise every one of them arrives as `Corrupt`, which is the answer
+// least likely to be true and the one that sends a caller looking in the wrong place.
+private readable(data: []const u8) -> Result[Info, Error]
+    val info = probe(data)?
+
+    if info.animated then return Err(Animated)
+
+    if short_of_its_riff(data) then return Err(Truncated)
+
+    Ok(info)
+
+// Decoded pixels, owned by libwebp until this handle goes.
+//
+// The rows are packed — `width * channels` bytes each, no padding — and the first pixel is the top
+// left.
+struct Image
+    private p: *u8
+
+    width: int
+    height: int
+
+    // 4 from `decode_rgba` and 3 from `decode_rgb`. There is no other value.
+    channels: int
+
+    // The pixels, in scan order: R, G, B, A, R, G, B, A… for four channels and R, G, B, R, G, B…
+    // for three.
+    //
+    // **A view into libwebp's storage**, so it lives exactly as long as this handle — a caller
+    // keeping the bytes past that has to copy them.
+    pixels(self) -> []const u8 = self.p[0..<self.len()]
+
+    // How many bytes the pixels occupy.
+    len(self) -> usize = usize(self.width) * usize(self.height) * usize(self.channels)
+end Image
+
+// libwebp allocated the pixels, so libwebp frees them.
+impl Drop for Image
+    drop(self)
+        c.free(self.p)
+    end drop
+
+// Decodes to four channels: R, G, B, A in scan order, whatever the file holds.
+//
+// **An image with no alpha decodes to an opaque one** rather than being refused, so this is the call
+// to reach for unless three channels are what the rest of the program wants. The dimensions come
+// back on the handle.
+decode_rgba(data: []const u8) -> Result[&Image, Error]
+    readable(data)?
+
+    var w = 0
+    var h = 0
+
+    val p = c.decode_rgba(as_ptr(data), data.len, &w, &h)
+
+    if usize(p) == 0 then return Err(Corrupt)
+
+    Ok(Image(p, w, h, 4))
+
+// Decodes to three channels: R, G, B in scan order. **Any alpha in the file is dropped**, not
+// composited — a pixel that was half transparent arrives at its full colour.
+decode_rgb(data: []const u8) -> Result[&Image, Error]
+    readable(data)?
+
+    var w = 0
+    var h = 0
+
+    val p = c.decode_rgb(as_ptr(data), data.len, &w, &h)
+
+    if usize(p) == 0 then return Err(Corrupt)
+
+    Ok(Image(p, w, h, 3))
+
+// Decodes four channels into a slice the caller already owns, answering what the header said.
+//
+// **Nothing is allocated here**, which is what makes this the call for a loop: no handle, no
+// destructor, and the pixels land where the program wanted them in the first place. `probe` is how
+// to find out how large `dst` has to be — `Info.rgba_len` is the number.
+//
+// `stride` is the distance in bytes between one row and the next; 0 means the rows are packed,
+// which is what `Info.rgba_len` assumes.
+decode_rgba_into(data: []const u8, dst: []u8, stride: int = 0) -> Result[Info, Error]
+    val info = readable(data)?
+
+    val row = fits(dst, info.width, info.height, 4, stride)?
+
+    val p = c.decode_rgba_into(as_ptr(data), data.len, as_mut_ptr(dst), dst.len, row)
+
+    if usize(p) == 0 then return Err(Corrupt)
+
+    Ok(info)
+
+// The same into a caller's slice at three channels, dropping any alpha.
+decode_rgb_into(data: []const u8, dst: []u8, stride: int = 0) -> Result[Info, Error]
+    val info = readable(data)?
+
+    val row = fits(dst, info.width, info.height, 3, stride)?
+
+    val p = c.decode_rgb_into(as_ptr(data), data.len, as_mut_ptr(dst), dst.len, row)
+
+    if usize(p) == 0 then return Err(Corrupt)
+
+    Ok(info)
+
+// ## Writing
+
+// An encoded WebP file, owned by libwebp until this handle goes.
+struct Encoded
+    private p: *u8
+    private n: usize
+
+    // The encoded bytes — a whole `.webp` file, RIFF header and all, ready to be written out or
+    // sent. A view into libwebp's storage, so it lives exactly as long as this handle.
+    bytes(self) -> []const u8 = self.p[0..<self.n]
+
+    // How many bytes the encoding came to.
+    len(self) -> usize = self.n
+end Encoded
+
+impl Drop for Encoded
+    drop(self)
+        c.free(self.p)
+    end drop
+
+// Checks a slice against the shape it is said to have, answering the row stride to use.
+//
+// libwebp is never told how long a slice is — the length is implied by the width, the height and
+// the stride — so a slice shorter than the shape describes would be read or written past its end.
+private fits(pixels: []const u8, width: int, height: int, channels: int,
+             stride: int) -> Result[int, Error]
+    val packed = width * channels
+    val row = if stride == 0 then packed else stride
+
+    if row < packed then return Err(Shape(usize(packed) * usize(height)))
+
+    val needed = usize(row) * usize(height)
+
+    if pixels.len < needed then return Err(Shape(needed))
+
+    Ok(row)
+
+// Checks the dimensions against what the format can hold.
+private sized(width: int, height: int) -> Result[unit, Error] =
+    if width < 1 || height < 1 || width > max_dimension() || height > max_dimension() then
+        Err(Dimensions(width, height))
+    else
+        Ok(())
+
+// Encodes four-channel pixels as a lossy WebP at `quality` from 0 to 100.
+//
+// 75 is libwebp's own default and `cwebp`'s. **The alpha channel is compressed losslessly whatever
+// the quality is** — that is the format rather than a choice made here — so a cutout stays crisp at
+// a quality that softens the colour behind it.
+//
+// `stride` is the distance in bytes between one row of the input and the next; 0 means the rows are
+// packed, which is what a decode from this package hands back.
+encode_rgba(pixels: []const u8, width: int, height: int, quality: f32 = 75.0,
+            stride: int = 0) -> Result[&Encoded, Error]
+    sized(width, height)?
+
+    if quality < 0.0 || quality > 100.0 then return Err(Quality(quality))
+
+    val row = fits(pixels, width, height, 4, stride)?
+
+    var p: *u8 = ptr_cast(0usize)
+
+    val n = c.encode_rgba(as_ptr(pixels), width, height, row, quality, &p)
+
+    if n == 0 then return Err(Refused)
+
+    Ok(Encoded(p, n))
+
+// The same for three-channel pixels. The file carries no alpha and is a little smaller for it.
+encode_rgb(pixels: []const u8, width: int, height: int, quality: f32 = 75.0,
+           stride: int = 0) -> Result[&Encoded, Error]
+    sized(width, height)?
+
+    if quality < 0.0 || quality > 100.0 then return Err(Quality(quality))
+
+    val row = fits(pixels, width, height, 3, stride)?
+
+    var p: *u8 = ptr_cast(0usize)
+
+    val n = c.encode_rgb(as_ptr(pixels), width, height, row, quality, &p)
+
+    if n == 0 then return Err(Refused)
+
+    Ok(Encoded(p, n))
+
+// Encodes four-channel pixels losslessly, in VP8L. There is no quality, because nothing is traded.
+//
+// **This is not `exact`, and the difference is worth knowing.** libwebp's default rewrites the
+// colour channels of *fully transparent* pixels to whatever compresses best, since nothing can see
+// them — so a round trip through this call returns every alpha exactly and may return different RGB
+// under `alpha == 0`. Everywhere else, every byte comes back. Turning it off needs `WebPEncode` and
+// a `WebPConfig`, which this package does not bind.
+encode_lossless_rgba(pixels: []const u8, width: int, height: int,
+                     stride: int = 0) -> Result[&Encoded, Error]
+    sized(width, height)?
+
+    val row = fits(pixels, width, height, 4, stride)?
+
+    var p: *u8 = ptr_cast(0usize)
+
+    val n = c.encode_lossless_rgba(as_ptr(pixels), width, height, row, &p)
+
+    if n == 0 then return Err(Refused)
+
+    Ok(Encoded(p, n))
+
+// The same for three-channel pixels. With no alpha there is nothing for the `exact` caveat above to
+// bite on, so this one really does return every byte.
+encode_lossless_rgb(pixels: []const u8, width: int, height: int,
+                    stride: int = 0) -> Result[&Encoded, Error]
+    sized(width, height)?
+
+    val row = fits(pixels, width, height, 3, stride)?
+
+    var p: *u8 = ptr_cast(0usize)
+
+    val n = c.encode_lossless_rgb(as_ptr(pixels), width, height, row, &p)
+
+    if n == 0 then return Err(Refused)
+
+    Ok(Encoded(p, n))
