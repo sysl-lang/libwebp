@@ -5,6 +5,8 @@ VP8's intra coder and comes out roughly a quarter smaller than a JPEG of the sam
 lossless mode beats PNG by about a fifth and, unlike PNG, it carries an alpha channel in the *lossy*
 mode too. One library, two coders, and one dial between them.
 
+*An independent sysl package for WebP. It is not affiliated with or endorsed by WebP's authors or trademark holders.*
+
 ```
 dependencies {
   libwebp { git = "github.com/sysl-lang/libwebp", version = "0.1.0" }
