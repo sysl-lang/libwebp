@@ -26,7 +26,7 @@ package {
 
   // The compiler this was written against and the only one it is known to build with. Lower it when
   // somebody builds this with an older one — a floor is meant to be a fact rather than a guess.
-  sysl = "0.0.105"
+  sysl = "0.6.0"
 }
 
 // **`heap`, and libwebp is the one allocating.** `WebPDecodeRGBA` and `WebPEncodeRGBA` both hand

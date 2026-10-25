@@ -2,7 +2,7 @@
 // struct the decoder fills in, and the status enumeration everything reports through.
 //
 // **Nothing is vendored.** libwebp is a system library — one package on macOS, Debian and Arch
-// alike — and `package.hocon` asks `pkg-config` where it is. So there is no `defines` block and no
+// alike — and `sysl.hocon` asks `pkg-config` where it is. So there is no `defines` block and no
 // build option to get wrong: the objects are the platform's, SIMD kernels included.
 //
 // Nothing here is meant to be called by a program. A decoder answers a pointer the library

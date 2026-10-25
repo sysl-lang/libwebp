@@ -66,6 +66,7 @@ module sh.sysl.libwebp
 
 import sh.sysl.libwebp.c
 import sysl.slices.{as_ptr, as_mut_ptr}
+import sysl.raw.ptr_cast
 
 // Why a decode or an encode did not happen.
 enum Error
