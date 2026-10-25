@@ -9,7 +9,7 @@ mode too. One library, two coders, and one dial between them.
 
 ```
 dependencies {
-  libwebp { git = "github.com/sysl-lang/libwebp", version = "0.1.0" }
+  libwebp { git = "github.com/sysl-lang/libwebp", version = "0.1.1" }
 }
 ```
 

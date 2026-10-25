@@ -3,11 +3,11 @@
 // This is the block a consumer writes to reach this package:
 //
 //     dependencies {
-//       libwebp { git = "github.com/sysl-lang/libwebp", version = "0.1.0" }
+//       libwebp { git = "github.com/sysl-lang/libwebp", version = "0.1.1" }
 //     }
 //
 // The coordinate is identity rather than a URL, so it carries no `https://`, and the version is the
-// tag `v0.1.0` on this repository.
+// tag `v0.1.1` on this repository.
 //
 // **libwebp has to be installed, and so do its headers.** Nothing is vendored: libwebp is a
 // quarter of a megabyte of C with its own CMake build, it carries hand-written SIMD for four
@@ -22,7 +22,7 @@
 
 package {
   name    = "libwebp"
-  version = "0.1.0"
+  version = "0.1.1"
 
   // The compiler this was written against and the only one it is known to build with. Lower it when
   // somebody builds this with an older one — a floor is meant to be a fact rather than a guess.
